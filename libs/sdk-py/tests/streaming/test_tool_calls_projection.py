@@ -247,6 +247,49 @@ def test_tool_call_handle_deltas_queue_is_bounded():
     asyncio.run(_make())
 
 
+@pytest.mark.parametrize("delta_count", [0, 1, 2])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_tool_call_handle_terminal_drains_buffered_deltas(
+    delta_count: int, failed: bool
+):
+    handle = ToolCallHandle(tool_call_id="call-1", name="search", max_queue_size=2)
+    expected = [f"part-{i}" for i in range(delta_count)]
+    for delta in expected:
+        handle._push_delta(delta)
+
+    if failed:
+        handle._fail(RuntimeError("tool failed"))
+        with pytest.raises(RuntimeError, match="tool failed"):
+            await handle.output
+    else:
+        handle._finish({"result": "ok"})
+        assert await handle.output == {"result": "ok"}
+
+    async def collect():
+        return [delta async for delta in handle.deltas]
+
+    assert await asyncio.wait_for(collect(), timeout=1) == expected
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_tool_call_handle_terminal_wakes_waiting_delta_consumer(failed: bool):
+    handle = ToolCallHandle(tool_call_id="call-1", name="search", max_queue_size=1)
+    iterator = handle.deltas
+    waiting = asyncio.create_task(anext(iterator, None))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+
+    if failed:
+        handle._fail(RuntimeError("tool failed"))
+        with pytest.raises(RuntimeError, match="tool failed"):
+            await handle.output
+    else:
+        handle._finish("ok")
+        assert await handle.output == "ok"
+
+    assert await asyncio.wait_for(waiting, timeout=1) is None
+
+
 def test_tool_call_handle_deltas_single_consumer_guard():
     """Accessing `handle.deltas` a second time must raise immediately.
 

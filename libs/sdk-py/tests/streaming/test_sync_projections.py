@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Generator
+from concurrent.futures import Future
 from typing import Any, cast
 
 import httpx
@@ -534,6 +536,148 @@ def test_sync_tool_call_handle_deltas_queue_is_bounded():
 
     handle_custom = SyncToolCallHandle(tool_call_id="tc2", name="bar", max_queue_size=8)
     assert handle_custom._deltas.maxsize == 8
+
+
+@pytest.mark.parametrize("delta_count", [0, 1, 2])
+@pytest.mark.parametrize("failed", [False, True])
+def test_sync_tool_call_terminal_drains_buffered_deltas(
+    delta_count: int, failed: bool, monkeypatch: pytest.MonkeyPatch
+):
+    handle = SyncToolCallHandle(tool_call_id="call-1", name="search", max_queue_size=2)
+    expected = [f"part-{i}" for i in range(delta_count)]
+    for delta in expected:
+        handle._push_delta(delta)
+    get = handle._deltas.get
+    monkeypatch.setattr(handle._deltas, "get", lambda: get(timeout=1))
+
+    if failed:
+        handle._fail(RuntimeError("tool failed"))
+        with pytest.raises(RuntimeError, match="tool failed"):
+            _ = handle.output
+    else:
+        handle._finish({"result": "ok"})
+        assert handle.output == {"result": "ok"}
+
+    assert list(handle.deltas) == expected
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_sync_tool_call_terminal_wakes_waiting_delta_consumer(
+    failed: bool, monkeypatch: pytest.MonkeyPatch
+):
+    handle = SyncToolCallHandle(tool_call_id="call-1", name="search", max_queue_size=1)
+    reading = threading.Event()
+    result: Future[list[str]] = Future()
+    get = handle._deltas.get
+
+    def observed_get():
+        reading.set()
+        return get(timeout=1)
+
+    def consume():
+        try:
+            result.set_result(list(handle.deltas))
+        except Exception as exc:
+            result.set_exception(exc)
+
+    monkeypatch.setattr(handle._deltas, "get", observed_get)
+    consumer = threading.Thread(target=consume)
+    consumer.start()
+    try:
+        assert reading.wait(timeout=1)
+        if failed:
+            handle._fail(RuntimeError("tool failed"))
+            with pytest.raises(RuntimeError, match="tool failed"):
+                _ = handle.output
+        else:
+            handle._finish("ok")
+            assert handle.output == "ok"
+        assert result.result(timeout=2) == []
+    finally:
+        consumer.join(timeout=2)
+    assert not consumer.is_alive()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_sync_tool_call_drains_while_terminal_signal_is_pending(
+    failed: bool, monkeypatch: pytest.MonkeyPatch
+):
+    handle = SyncToolCallHandle(tool_call_id="call-1", name="search", max_queue_size=2)
+    handle._push_delta("first")
+    handle._push_delta("second")
+    signaling = threading.Event()
+    release = threading.Event()
+    result: Future[None] = Future()
+    put_nowait = handle._deltas.put_nowait
+    get = handle._deltas.get
+
+    def delayed_signal(item):
+        if item is None:
+            signaling.set()
+            assert release.wait(timeout=3)
+        put_nowait(item)
+
+    def finish():
+        try:
+            if failed:
+                handle._fail(RuntimeError("tool failed"))
+            else:
+                handle._finish("ok")
+            result.set_result(None)
+        except Exception as exc:
+            result.set_exception(exc)
+
+    monkeypatch.setattr(handle._deltas, "put_nowait", delayed_signal)
+    monkeypatch.setattr(handle._deltas, "get", lambda: get(timeout=1))
+    producer = threading.Thread(target=finish)
+    producer.start()
+    try:
+        assert signaling.wait(timeout=1)
+        # The producer has published `done` but has not inserted the sentinel.
+        # The consumer must drain both values and finish without waiting for it.
+        assert list(handle.deltas) == ["first", "second"]
+    finally:
+        release.set()
+        producer.join(timeout=2)
+    assert not producer.is_alive()
+    result.result(timeout=1)
+    if failed:
+        with pytest.raises(RuntimeError, match="tool failed"):
+            _ = handle.output
+    else:
+        assert handle.output == "ok"
+
+
+@pytest.mark.parametrize("delta_count", [1023, 1024])
+@pytest.mark.parametrize("failed", [False, True])
+def test_sync_tool_calls_terminal_at_delta_buffer_boundary(
+    delta_count: int, failed: bool
+):
+    fake = SyncFakeServer()
+    events = [lifecycle_started_event(seq=0), tool_started_event(seq=1)]
+    events.extend(
+        tool_output_delta_event(seq=i + 2, delta=str(i)) for i in range(delta_count)
+    )
+    events.append(
+        tool_error_event(seq=delta_count + 2, message="tool failed")
+        if failed
+        else tool_finished_event(seq=delta_count + 2, output="ok")
+    )
+    events.append(lifecycle_completed_event(seq=delta_count + 3))
+    fake.script(events)
+    with httpx.Client(transport=fake.transport, base_url="http://test") as raw:
+        threads = SyncThreadsClient(SyncHttpClient(raw))
+        with threads.stream(assistant_id="agent") as thread:
+            thread.run.start(input={})
+            calls = list(thread.tool_calls)
+
+    assert len(calls) == 1
+    assert list(calls[0].deltas) == [str(i) for i in range(delta_count)]
+    if failed:
+        with pytest.raises(RuntimeError, match="tool failed"):
+            _ = calls[0].output
+    else:
+        assert calls[0].output == "ok"
 
 
 # ---------------------------------------------------------------------------

@@ -1016,6 +1016,8 @@ class ToolCallHandle:
 
     async def _delta_iter(self) -> AsyncGenerator[str, None]:
         while True:
+            if self.done and self._deltas.empty():
+                return
             item = await self._deltas.get()
             if item is None:
                 return  # errors surface via output, not deltas
@@ -1032,7 +1034,9 @@ class ToolCallHandle:
         self.done = True
         if not self.output.done():
             self.output.set_result(output)
-        self._deltas.put_nowait(None)
+        # A full buffer drains before observing `done`; keep all queued deltas.
+        with contextlib.suppress(asyncio.QueueFull):
+            self._deltas.put_nowait(None)
 
     def _fail(self, err: BaseException) -> None:
         if self.done:
@@ -1041,7 +1045,8 @@ class ToolCallHandle:
         self.error = err
         if not self.output.done():
             self.output.set_exception(err)
-        self._deltas.put_nowait(None)
+        with contextlib.suppress(asyncio.QueueFull):
+            self._deltas.put_nowait(None)
 
 
 class _ToolCallsProjection:
