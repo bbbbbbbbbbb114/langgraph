@@ -520,6 +520,8 @@ class SyncToolCallHandle:
 
     def _delta_iter(self) -> Iterator[str]:
         while True:
+            if self.done and self._deltas.empty():
+                return
             item = self._deltas.get()
             if item is None:
                 return
@@ -535,7 +537,9 @@ class SyncToolCallHandle:
             return
         self.done = True
         self._result.set_result(output)
-        self._deltas.put_nowait(None)
+        # A full buffer drains before observing `done`; keep all queued deltas.
+        with contextlib.suppress(queue.Full):
+            self._deltas.put_nowait(None)
 
     def _fail(self, err: BaseException) -> None:
         if self.done:
@@ -543,7 +547,8 @@ class SyncToolCallHandle:
         self.done = True
         self.error = err
         self._result.set_exception(err)
-        self._deltas.put_nowait(None)
+        with contextlib.suppress(queue.Full):
+            self._deltas.put_nowait(None)
 
 
 class _SyncToolCallsProjection:
